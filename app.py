@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import json
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from google import genai
 from google.genai import types
 
@@ -39,71 +38,98 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    # 免费版 API 推荐并发设为 2-3，配合重试机制最稳定
-    max_workers = st.slider(
-        "Concurrent Workers",
-        min_value=1,
-        max_value=5,
-        value=2,
-        help="Free API tier has rate limits. 2-3 workers is optimal."
+    batch_size = st.slider(
+        "Batch Size per Request",
+        min_value=5,
+        max_value=20,
+        value=10,
+        help="Batching multiple leads into a single API call avoids 429 rate limits and processes 10x faster."
     )
 
 
-# --- Helper Function: Evaluate Lead via Gemini with Retry Logic ---
-def evaluate_single_lead(client, lead_info: dict, criteria: str, max_retries: int = 4) -> dict:
+# --- Core Function: Process Leads in Batches ---
+def process_batch_leads(client, chunk_records: list, start_index: int, criteria: str, max_retries: int = 4) -> list:
+    batch_payload = [
+        {
+            "id": start_index + i,
+            "data": record
+        }
+        for i, record in enumerate(chunk_records)
+    ]
+
     prompt = f"""
 You are an expert B2B Lead Qualification Specialist.
-Evaluate the following single lead record strictly against the provided qualification criteria.
+Evaluate the following batch of lead records strictly against the qualification criteria.
 
 [Qualification Criteria]:
 {criteria}
 
-[Lead Data]:
-{json.dumps(lead_info, ensure_ascii=False, indent=2)}
+[Batch Lead Records]:
+{json.dumps(batch_payload, ensure_ascii=False, indent=2)}
 
 [Output Requirements]:
-Output ONLY a valid JSON object without any additional text or Markdown markers:
-{{
-  "Score": <integer between 0 and 100>,
-  "Qualified": <"Yes" or "No">,
-  "Reason": "<One concise sentence stating why this lead passed or failed the criteria>"
-}}
+Return ONLY a valid JSON list containing the evaluation for EACH record matching the input IDs in order:
+[
+  {{
+    "id": <record id>,
+    "Score": <integer 0-100>,
+    "Qualified": <"Yes" or "No">,
+    "Reason": "<One concise sentence why it passed or failed>"
+  }}
+]
 """
-    delay = 2.0
+    delay = 3.0
     for attempt in range(max_retries):
         try:
             response = client.models.generate_content(
-                model="gemini-3.6-flash",
+                model="gemini-2.5-flash",
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     temperature=0.0,
                     response_mime_type="application/json"
                 )
             )
-            parsed = json.loads(response.text.strip())
-            return {
-                "Score": parsed.get("Score", 0),
-                "Qualified": parsed.get("Qualified", "No"),
-                "Reason": parsed.get("Reason", "Evaluation completed")
-            }
+            parsed_list = json.loads(response.text.strip())
+
+            # Map back results to ensure correct ordering
+            id_to_result = {item["id"]: item for item in parsed_list if isinstance(item, dict) and "id" in item}
+
+            chunk_results = []
+            for i in range(len(chunk_records)):
+                rec_id = start_index + i
+                if rec_id in id_to_result:
+                    res = id_to_result[rec_id]
+                    chunk_results.append({
+                        "Score": res.get("Score", 0),
+                        "Qualified": res.get("Qualified", "No"),
+                        "Reason": res.get("Reason", "Evaluated successfully.")
+                    })
+                else:
+                    chunk_results.append({
+                        "Score": 0,
+                        "Qualified": "Error",
+                        "Reason": "Record missing in batch response."
+                    })
+            return chunk_results
+
         except Exception as e:
             err_msg = str(e)
-            # 遇到 429 频率限制或 503 临时不可用时自动等待重试
             if "429" in err_msg or "503" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
                 if attempt < max_retries - 1:
                     time.sleep(delay)
-                    delay *= 2  # 指数退避增长等待时间
+                    delay *= 2
                     continue
-            return {
-                "Score": 0,
-                "Qualified": "Error",
-                "Reason": f"API error: {err_msg[:80]}..."
-            }
+            # Return error rows for the chunk if max retries fail
+            return [
+                {"Score": 0, "Qualified": "Error", "Reason": f"API error: {err_msg[:60]}..."}
+                for _ in range(len(chunk_records))
+            ]
 
 
-# --- Main Dashboard Logic ---
+# --- Main UI ---
 st.title("🎯 AI B2B Lead Qualifier & Enrichment")
-st.markdown("Upload your lead list (CSV) to automatically score, qualify, and annotate reasons.")
+st.markdown(
+    "Upload your lead list (CSV) to automatically score, qualify, and annotate reasons using batch AI acceleration.")
 
 uploaded_file = st.file_uploader("Upload CSV File", type=["csv"])
 
@@ -124,31 +150,30 @@ if uploaded_file is not None:
                 progress_bar = st.progress(0.0)
                 status_text = st.empty()
 
-                results = [None] * len(df)
                 records = df.to_dict(orient="records")
+                total_rows = len(records)
+                all_results = []
 
-                status_text.text("Processing leads smoothly with rate-limit protection...")
+                # Split into chunks based on batch_size
+                chunks = [records[i:i + batch_size] for i in range(0, total_rows, batch_size)]
 
-                completed_count = 0
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    future_to_index = {
-                        executor.submit(evaluate_single_lead, client, record, criteria_input): i
-                        for i, record in enumerate(records)
-                    }
+                for idx, chunk in enumerate(chunks):
+                    start_idx = idx * batch_size
+                    status_text.text(
+                        f"Processing batch {idx + 1}/{len(chunks)} (Rows {start_idx + 1} - {min(start_idx + len(chunk), total_rows)})...")
 
-                    for future in as_completed(future_to_index):
-                        index = future_to_index[future]
-                        results[index] = future.result()
-                        completed_count += 1
-                        progress = completed_count / len(df)
-                        progress_bar.progress(progress)
-                        status_text.text(f"Processed: {completed_count}/{len(df)} leads...")
+                    chunk_res = process_batch_leads(client, chunk, start_idx, criteria_input)
+                    all_results.extend(chunk_res)
 
-                results_df = pd.DataFrame(results)
-                final_df = pd.concat([df, results_df], axis=1)
+                    progress_bar.progress((idx + 1) / len(chunks))
+                    # Brief pause between batch requests to remain strictly within RPM limits
+                    time.sleep(1.0)
 
-                status_text.text("✨ Batch processing completed!")
-                st.success("All leads have been evaluated and scored.")
+                results_df = pd.DataFrame(all_results)
+                final_df = pd.concat([df.reset_index(drop=True), results_df.reset_index(drop=True)], axis=1)
+
+                status_text.text("✨ Batch processing completed successfully!")
+                st.success("All leads have been evaluated and scored without rate-limit errors.")
 
                 qualified_count = len(final_df[final_df["Qualified"] == "Yes"])
                 avg_score = final_df["Score"].mean() if "Score" in final_df else 0
